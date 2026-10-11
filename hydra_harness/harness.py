@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from . import database
+from . import evaluator
+from . import memory
 from . import sandbox
 
 TASK_A: Dict[str, Any] = {
@@ -20,6 +22,7 @@ TASK_A: Dict[str, Any] = {
         "resource": "customers",
         "endpoint": "/v1/customers",
     },
+    "recall": False,
 }
 
 TASK_B: Dict[str, Any] = {
@@ -29,8 +32,35 @@ TASK_B: Dict[str, Any] = {
     "payload": {
         "resource": "orders",
         "endpoint": "/v1/orders",
+        "idempotency_key": "ord-1042",
     },
 }
+
+GUARDRAIL_TEXT = "This agent may call query_collection only with an idempotency key."
+
+TASK_RECALL: Dict[str, Any] = {
+    "id": "R",
+    "title": "List invoices",
+    "endpoint": "/v1/invoices",
+    "payload": {
+        "resource": "invoices",
+        "endpoint": "/v1/invoices",
+    },
+    "trace_query": (
+        "A collection read was rejected. The invoices contract had no version header, "
+        "no page size, and no bearer credential."
+    ),
+}
+
+API_NOTE = (
+    "Collection reads declare api_version, pagination_limit, and auth_bearer "
+    "on the tool schema. pagination_limit is a positive integer no larger than 25. "
+    "auth_bearer must be a secret reference, not a live credential. "
+    "Store one guardrail: this agent may call the tool only with an idempotency key, "
+    "and the schema must declare that key as idempotency_key. "
+    "Return JSON with diagnosis, mutated_schema, and guardrails. "
+    "Keep the current tool name and every existing field. Do not add a tool."
+)
 
 REPAIR_VALUES: Dict[str, Any] = {
     "api_version": "2024-10-01",
@@ -40,12 +70,9 @@ REPAIR_VALUES: Dict[str, Any] = {
 
 _PROPOSER_INSTRUCTIONS = (
     "You repair tool schemas for the Hydra recursive harness. "
-    "Return a JSON object with two keys: diagnosis (one sentence) and "
-    "mutated_schema (the full tool schema). "
-    "Preserve name, description, method, and every existing parameter. "
-    "Add any missing required parameters inside parameters using exactly "
-    "these values: api_version='2024-10-01', pagination_limit=25, "
-    "auth_bearer='${API_TOKEN}'. Do not remove fields and do not add tools."
+    "Return a JSON object with diagnosis, mutated_schema, and guardrails. "
+    "Use the failure and the API note. Choose the parameter values yourself. "
+    "Preserve the tool name and every existing field. Do not add a tool."
 )
 
 
@@ -55,6 +82,10 @@ class Proposal:
     diagnosis: str
     source: str
     note: Optional[str] = None
+    guardrails: List[str] = field(default_factory=list)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    invoked_model: bool = False
 
 
 @dataclass
@@ -78,6 +109,12 @@ class HarnessReport:
     request: Optional[Dict[str, Any]]
     spans: List[Dict[str, Any]] = field(default_factory=list)
     sandbox_runs: List[Dict[str, Any]] = field(default_factory=list)
+    model_calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    rejected_patches: List[Dict[str, Any]] = field(default_factory=list)
+    guardrails: List[str] = field(default_factory=list)
+    vector_match: Optional[Dict[str, Any]] = None
 
 
 class TelemetryIntercept:
@@ -319,49 +356,103 @@ def deterministic_mutation(schema: Dict[str, Any], failure: str) -> Proposal:
     parameters.update(REPAIR_VALUES)
     parameters["pagination_limit"] = _coerce_limit(parameters["pagination_limit"])
     mutated["parameters"] = parameters
+    parameters["idempotency_key"] = "${IDEMPOTENCY_KEY}"
     return Proposal(
         schema=mutated,
         diagnosis=(
-            "Added missing transport parameters api_version, pagination_limit, and auth_bearer."
+            "Deterministic fallback, last resort: restored the transport fields "
+            "and stored the idempotency guardrail."
         ),
         source="deterministic",
+        note="deterministic fallback, last resort",
+        guardrails=[GUARDRAIL_TEXT],
     )
 
 
-def _merge_schema(current: Dict[str, Any], proposed: Dict[str, Any]) -> Dict[str, Any]:
-    merged = copy.deepcopy(current)
-    for key, value in proposed.items():
-        if key == "parameters" and isinstance(value, dict):
-            continue
-        merged[key] = copy.deepcopy(value)
-
-    parameters = dict(current.get("parameters") or {})
-    incoming = proposed.get("parameters")
-    if isinstance(incoming, dict):
-        properties = incoming.get("properties")
-        if isinstance(properties, dict):
-            for name, spec in properties.items():
-                if isinstance(spec, dict):
-                    if "const" in spec:
-                        parameters[name] = spec["const"]
-                    elif "default" in spec:
-                        parameters[name] = spec["default"]
-                    elif "example" in spec:
-                        parameters[name] = spec["example"]
-                elif spec not in (None, ""):
-                    parameters[name] = spec
-        for name, spec in incoming.items():
-            if name in ("type", "required", "properties", "additionalProperties"):
-                continue
-            if spec not in (None, ""):
-                parameters[name] = spec
+def proposal_from_memory(schema: Dict[str, Any], hit: Dict[str, Any]) -> Proposal:
+    """Apply a past repair onto the current tool without calling the model."""
+    repaired = copy.deepcopy(schema)
+    parameters = dict(repaired.get("parameters") or {})
+    learned = hit.get("repair_parameters") or {}
+    for name in ("api_version", "pagination_limit", "auth_bearer", "idempotency_key"):
+        if learned.get(name) not in (None, ""):
+            parameters[name] = learned[name]
     if "pagination_limit" in parameters:
         parameters["pagination_limit"] = _coerce_limit(parameters["pagination_limit"])
-    merged["parameters"] = parameters
-    return merged
+    repaired["parameters"] = parameters
+    score = float(hit.get("score") or 0.0)
+    return Proposal(
+        schema=repaired,
+        diagnosis="Reused a past repair found by Atlas Vector Search.",
+        source="atlas-vector-search",
+        note="matched {} at {:.2f}".format(hit.get("agent_id") or "a prior agent", score),
+        guardrails=list(hit.get("guardrails") or []),
+    )
 
 
-def _parse_proposal(raw: str, current: Dict[str, Any]) -> Proposal:
+def _guardrail_list(data: Dict[str, Any], mutated: Dict[str, Any]) -> List[str]:
+    raw = data.get("guardrails")
+    if raw is None:
+        raw = mutated.get("guardrails")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _accepted_schema(current: Dict[str, Any], proposed: Dict[str, Any]) -> Dict[str, Any]:
+    """Store a patch that already passed the invariant check."""
+    accepted = copy.deepcopy(current)
+    for key in ("description", "method"):
+        if proposed.get(key) not in (None, ""):
+            accepted[key] = proposed[key]
+    accepted["name"] = current.get("name")
+    parameters = dict(accepted.get("parameters") or {})
+    parameters.update(evaluator._parameter_map(proposed))
+    if "pagination_limit" in parameters:
+        parameters["pagination_limit"] = _coerce_limit(parameters["pagination_limit"])
+    accepted["parameters"] = parameters
+    return accepted
+
+
+def constraint_violation(
+    current: Dict[str, Any],
+    proposed: Dict[str, Any],
+    guardrails: List[str],
+) -> Optional[str]:
+    """Reject a patch that drops a field, invents a tool, or skips the guardrail."""
+    if not isinstance(proposed, dict):
+        return "Rejected patch: schema was not an object."
+    if isinstance(proposed.get("tools"), list):
+        return "Rejected patch: invented an extra tool."
+    if proposed.get("name") != current.get("name"):
+        return "Rejected patch: invented a tool named {}.".format(proposed.get("name"))
+    for key in ("description", "method"):
+        if current.get(key) and proposed.get(key) in (None, ""):
+            return "Rejected patch: dropped existing field {}.".format(key)
+    current_params = evaluator._parameter_map(current)
+    proposed_params = evaluator._parameter_map(proposed)
+    for key in current_params:
+        if key not in proposed_params:
+            return "Rejected patch: dropped existing parameter {}.".format(key)
+    missing = evaluator.missing_parameter(proposed)
+    if missing:
+        return "Rejected patch: still missing {}.".format(missing)
+    limit = proposed_params.get("pagination_limit")
+    if isinstance(limit, str) and str(limit).isdigit():
+        limit = int(limit)
+    if isinstance(limit, int) and not isinstance(limit, bool) and limit > 25:
+        return "Rejected patch: pagination_limit must be 25 or less."
+    if not proposed_params.get("idempotency_key"):
+        return "Rejected patch: schema does not declare idempotency_key."
+    text = " ".join(guardrails).lower()
+    if "idempotency" not in text:
+        return "Rejected patch: missing an idempotency guardrail."
+    return None
+
+
+def _parse_proposal(raw: str) -> Proposal:
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError("proposer returned a non-object")
@@ -369,11 +460,15 @@ def _parse_proposal(raw: str, current: Dict[str, Any]) -> Proposal:
     mutated = data.get("mutated_schema") or data.get("tool_schema") or data.get("schema")
     if not isinstance(mutated, dict):
         raise ValueError("proposer omitted mutated_schema")
+    mutated = copy.deepcopy(mutated)
+    guardrails = _guardrail_list(data, mutated)
+    mutated.pop("guardrails", None)
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
     return Proposal(
-        schema=_merge_schema(current, mutated),
+        schema=mutated,
         diagnosis=diagnosis,
         source=model,
+        guardrails=guardrails,
     )
 
 
@@ -392,13 +487,15 @@ class LLMProposer:
         model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
         if not _configured_secret(key):
             proposal = deterministic_mutation(schema, failure)
-            proposal.note = "OPENAI_API_KEY is unset or still a placeholder"
+            proposal.note = "deterministic fallback, last resort (OPENAI_API_KEY is unset or still a placeholder)"
             return proposal
         try:
             return self._complete(key, model, schema, prompt_rules, failure, task, rejection)
         except Exception as exc:
             proposal = deterministic_mutation(schema, failure)
-            proposal.note = "OpenAI request failed ({})".format(type(exc).__name__)
+            proposal.note = "deterministic fallback, last resort (OpenAI request failed: {})".format(
+                type(exc).__name__
+            )
             return proposal
 
     def _complete(
@@ -416,10 +513,10 @@ class LLMProposer:
         payload = {
             "failure": failure,
             "previous_rejection": rejection,
+            "api_note": API_NOTE,
             "task": {"id": task["id"], "endpoint": task["endpoint"]},
             "prompt_rules": prompt_rules,
             "tool_schema": schema,
-            "required_parameter_values": REPAIR_VALUES,
         }
         client = OpenAI(api_key=key, timeout=25.0)
         completion = client.chat.completions.create(
@@ -434,8 +531,19 @@ class LLMProposer:
                 },
             ],
         )
+        usage = completion.usage
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
         content = completion.choices[0].message.content or ""
-        return _parse_proposal(content, schema)
+        try:
+            proposal = _parse_proposal(content)
+        except (ValueError, json.JSONDecodeError):
+            proposal = deterministic_mutation(schema, failure)
+            proposal.note = "deterministic fallback, last resort (model response was not a usable schema)"
+        proposal.prompt_tokens = prompt_tokens
+        proposal.completion_tokens = completion_tokens
+        proposal.invoked_model = True
+        return proposal
 
 
 def inner_execution_loop(
@@ -446,7 +554,13 @@ def inner_execution_loop(
     """Load the active schema from Atlas and run one tool call."""
     state = database.get_latest_state(agent_id, initial_schema=initial_schema)
     schema = state["tool_schema"]
-    trial = sandbox.execute(schema, task["payload"], phase="execute")
+    guardrails = list(state.get("guardrails") or [])
+    trial = sandbox.execute(
+        schema,
+        task["payload"],
+        phase="execute",
+        guardrails=guardrails,
+    )
     ok, message = trial.ok, trial.message
     span = None
     if not ok:
@@ -467,50 +581,170 @@ def inner_execution_loop(
     }
 
 
+def _record_usage(usage: Dict[str, int], proposal: Proposal) -> None:
+    if not proposal.invoked_model:
+        return
+    usage["model_calls"] += 1
+    usage["prompt_tokens"] += proposal.prompt_tokens
+    usage["completion_tokens"] += proposal.completion_tokens
+
+
+def _rejected_patch(proposal: Proposal, reason: str) -> Dict[str, Any]:
+    return {
+        "reason": reason,
+        "schema": copy.deepcopy(proposal.schema),
+        "guardrails": list(proposal.guardrails),
+        "source": proposal.source,
+    }
+
+
+def _prove(proposal: Proposal, task: Dict[str, Any]) -> tuple:
+    bare = {
+        key: value
+        for key, value in task["payload"].items()
+        if key != "idempotency_key"
+    }
+    compliant = dict(task["payload"])
+    key = compliant.get("idempotency_key")
+    if not (isinstance(key, str) and key.strip()):
+        compliant["idempotency_key"] = "sandbox-verify-1"
+    blocked = sandbox.execute(
+        proposal.schema,
+        bare,
+        phase="guardrail",
+        guardrails=proposal.guardrails,
+    )
+    verified = sandbox.execute(
+        proposal.schema,
+        compliant,
+        phase="verify",
+        guardrails=proposal.guardrails,
+    )
+    return blocked, verified
+
+
 def outer_mutation_loop(
     agent_id: str,
     state: Dict[str, Any],
     failure: str,
     task: Dict[str, Any],
+    on_stage: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Propose a repair, prove it in the sandbox, then write the next Atlas version."""
+    """Propose a repair, reject a bad patch, prove the rest in the sandbox, then commit."""
+
+    def stage(name: str, **info: Any) -> None:
+        if on_stage is not None:
+            on_stage(name, info)
+
     proposer = LLMProposer()
     schema = state["tool_schema"]
     rules = str(state.get("prompt_rules") or "")
     trials = []
-    proposal = proposer.propose(schema, rules, failure, task)
-    trial = sandbox.execute(proposal.schema, task["payload"], phase="verify")
-    trials.append(trial)
-    if not trial.ok and proposal.source != "deterministic":
-        proposal = proposer.propose(
-            schema,
-            rules,
-            failure,
-            task,
-            rejection=trial.message,
-        )
-        trial = sandbox.execute(proposal.schema, task["payload"], phase="verify")
-        trials.append(trial)
-    if not trial.ok:
-        proposal = deterministic_mutation(schema, failure)
-        trial = sandbox.execute(proposal.schema, task["payload"], phase="verify")
-        trials.append(trial)
-    if not trial.ok:
-        raise RuntimeError(trial.message)
+    rejected: List[Dict[str, Any]] = []
+    usage = {"model_calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
+    rejection: Optional[str] = None
+    chosen: Optional[Proposal] = None
+    vector_match: Optional[Dict[str, Any]] = None
+    query = str(task.get("trace_query") or "").strip() or memory.trace_text(task, failure, schema)
+    wait = 25.0 if task.get("trace_query") else 0.0
+    hit = memory.recall(query, timeout_seconds=wait) if task.get("recall", True) else None
+    if hit is not None:
+        candidate = proposal_from_memory(schema, hit)
+        violation = constraint_violation(schema, candidate.schema, candidate.guardrails)
+        if violation:
+            rejected.append(_rejected_patch(candidate, violation))
+        else:
+            chosen = candidate
+            vector_match = {
+                "agent_id": hit.get("agent_id"),
+                "score": hit.get("score"),
+                "error_text": hit.get("error_text"),
+                "trace_text": hit.get("trace_text"),
+                "endpoint": hit.get("endpoint"),
+            }
 
-    trial.gate = True
+    if chosen is None:
+        stage("model")
+        for _ in range(2):
+            proposal = proposer.propose(schema, rules, failure, task, rejection=rejection)
+            _record_usage(usage, proposal)
+            if proposal.source == "deterministic":
+                chosen = proposal
+                break
+            violation = constraint_violation(schema, proposal.schema, proposal.guardrails)
+            if violation:
+                rejected.append(_rejected_patch(proposal, violation))
+                rejection = violation
+                continue
+            chosen = proposal
+            chosen.schema = _accepted_schema(schema, proposal.schema)
+            break
+
+    if chosen is None:
+        chosen = deterministic_mutation(schema, failure)
+
+    stage(
+        "model",
+        done=True,
+        proposer=chosen.source,
+        model_calls=usage["model_calls"],
+        tokens=usage["prompt_tokens"] + usage["completion_tokens"],
+        diagnosis=chosen.diagnosis,
+    )
+    stage("prove")
+    blocked, verified = _prove(chosen, task)
+    trials.extend((blocked, verified))
+    if (not verified.ok or blocked.ok) and chosen.source != "deterministic":
+        reason = (
+            verified.message
+            if not verified.ok
+            else "Sandbox rejected the patch: a call without idempotency_key was allowed."
+        )
+        rejected.append(_rejected_patch(chosen, reason))
+        chosen = deterministic_mutation(schema, failure)
+        blocked, verified = _prove(chosen, task)
+        trials.extend((blocked, verified))
+    if not verified.ok or blocked.ok:
+        raise RuntimeError(verified.message if not verified.ok else blocked.message)
+
+    verified.gate = True
+    stage("prove", sandbox=verified.as_dict())
     saved = database.save_mutated_state(
         agent_id,
         int(state["version"]) + 1,
-        proposal.schema,
-        proposal.diagnosis,
+        chosen.schema,
+        chosen.diagnosis,
+        guardrails=chosen.guardrails,
+    )
+    stage(
+        "commit",
+        version=int(saved["version"]),
+        document_id=str(saved.get("_id") or ""),
+        guardrails=list(saved.get("guardrails") or []),
+        schema_before=schema,
+        schema_after=saved["tool_schema"],
+    )
+    stage("embed")
+    memory.remember(
+        agent_id,
+        task,
+        failure,
+        schema,
+        evaluator._parameter_map(chosen.schema),
+        list(chosen.guardrails),
+        chosen.diagnosis,
     )
     return {
-        "proposal": proposal,
-        "verify_message": trial.message,
+        "proposal": chosen,
+        "verify_message": verified.message,
         "saved": saved,
-        "request": trial.request,
+        "request": verified.request,
         "sandbox_runs": [item.as_dict() for item in trials],
+        "model_calls": usage["model_calls"],
+        "prompt_tokens": usage["prompt_tokens"],
+        "completion_tokens": usage["completion_tokens"],
+        "rejected_patches": rejected,
+        "vector_match": vector_match,
     }
 
 
@@ -520,14 +754,23 @@ def run_task(
     *,
     repair: bool,
     initial_schema: Optional[Dict[str, Any]] = None,
+    on_stage: Optional[Any] = None,
 ) -> HarnessReport:
     """Inner loop first. The outer loop runs only after a failed execution."""
+
+    def stage(name: str, **info: Any) -> None:
+        if on_stage is not None:
+            on_stage(name, info)
+
+    if repair:
+        stage("fail", message="Running the tool in the sandbox.", sandbox={})
     first = inner_execution_loop(agent_id, task, initial_schema=initial_schema)
     state = first["state"]
     spans = [first["span"]] if first["span"] else []
     sandbox_runs = [first["sandbox"]] if first.get("sandbox") else []
 
-    if first["ok"] or not repair:
+    guardrail_block = str(first["message"]).startswith("Guardrail")
+    if first["ok"] or not repair or guardrail_block:
         if first["ok"]:
             telemetry().record(
                 agent_id=agent_id,
@@ -558,7 +801,9 @@ def run_task(
             sandbox_runs=sandbox_runs,
         )
 
-    mutation = outer_mutation_loop(agent_id, state, first["message"], task)
+    stage("fail", message=first["message"], sandbox=first.get("sandbox") or {})
+    stage("trace", message=first["message"])
+    mutation = outer_mutation_loop(agent_id, state, first["message"], task, on_stage=on_stage)
     saved = mutation["saved"]
     proposal: Proposal = mutation["proposal"]
     sandbox_runs.extend(mutation["sandbox_runs"])
@@ -589,4 +834,10 @@ def run_task(
         request=mutation["request"],
         spans=spans,
         sandbox_runs=sandbox_runs,
+        model_calls=int(mutation["model_calls"]),
+        prompt_tokens=int(mutation["prompt_tokens"]),
+        completion_tokens=int(mutation["completion_tokens"]),
+        rejected_patches=list(mutation["rejected_patches"]),
+        guardrails=list(saved.get("guardrails") or []),
+        vector_match=mutation.get("vector_match"),
     )

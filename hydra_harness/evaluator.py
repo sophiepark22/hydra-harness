@@ -74,6 +74,13 @@ def execution_request(schema: Dict[str, Any], test_payload: Dict[str, Any]) -> D
     limit = present.get("pagination_limit")
     if isinstance(limit, str) and limit.isdigit():
         limit = int(limit)
+    headers = {
+        "Authorization": "Bearer {}".format(present.get("auth_bearer")),
+        "X-Api-Version": present.get("api_version"),
+    }
+    idempotency_key = test_payload.get("idempotency_key")
+    if isinstance(idempotency_key, str) and idempotency_key.strip():
+        headers["Idempotency-Key"] = idempotency_key.strip()
     return {
         "tool": schema.get("name", "query_collection"),
         "method": schema.get("method", "GET"),
@@ -82,21 +89,33 @@ def execution_request(schema: Dict[str, Any], test_payload: Dict[str, Any]) -> D
             "resource": test_payload.get("resource"),
             "limit": limit,
         },
-        "headers": {
-            "Authorization": "Bearer {}".format(present.get("auth_bearer")),
-            "X-Api-Version": present.get("api_version"),
-        },
+        "headers": headers,
     }
+
+
+def guardrail_failure(
+    test_payload: Dict[str, Any],
+    guardrails: Optional[list] = None,
+) -> Optional[str]:
+    """Reject a call that breaks a guardrail stored on the active version."""
+    rules = [str(item).lower() for item in (guardrails or [])]
+    if not any("idempotency" in rule for rule in rules):
+        return None
+    key = test_payload.get("idempotency_key") if isinstance(test_payload, dict) else None
+    if isinstance(key, str) and key.strip():
+        return None
+    return "Guardrail rejected the call: idempotency_key is required."
 
 
 def validate_tool_execution(
     schema: Dict[str, Any],
     test_payload: Dict[str, Any],
+    guardrails: Optional[list] = None,
 ) -> Tuple[bool, str]:
     """Run a test execution against the schema.
 
-    Missing transport fields fail closed. A complete schema is treated as a
-    successful tool call for the supplied payload.
+    Missing transport fields fail closed. A stored idempotency guardrail
+    rejects a payload that does not carry idempotency_key.
     """
     if not isinstance(schema, dict) or not isinstance(test_payload, dict):
         return False, "Missing required tool parameter: api_version"
@@ -104,6 +123,17 @@ def validate_tool_execution(
     missing = missing_parameter(schema)
     if missing:
         return False, "Missing required tool parameter: {}".format(missing)
+
+    present = _parameter_map(schema)
+    limit = present.get("pagination_limit")
+    if isinstance(limit, str) and limit.isdigit():
+        limit = int(limit)
+    if isinstance(limit, int) and limit > 25:
+        return False, "Guardrail rejected the call: pagination_limit must be 25 or less."
+
+    blocked = guardrail_failure(test_payload, guardrails)
+    if blocked:
+        return False, blocked
 
     request = execution_request(schema, test_payload)
     if not request.get("endpoint") and not request["query"].get("resource"):
@@ -129,4 +159,12 @@ if __name__ == "__main__":
         },
     }
     assert validate_tool_execution(repaired, payload) == (True, SUCCESS_MESSAGE)
+    rule = ["This agent may call query_collection only with an idempotency key."]
+    assert validate_tool_execution(repaired, payload, rule) == (
+        False,
+        "Guardrail rejected the call: idempotency_key is required.",
+    )
+    covered = dict(payload)
+    covered["idempotency_key"] = "cust-1"
+    assert validate_tool_execution(repaired, covered, rule)[0] is True
     print(SUCCESS_MESSAGE)

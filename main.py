@@ -49,6 +49,11 @@ def step(console: Console, number: str, title: str) -> None:
     console.rule("[bold bright_cyan]{}   {}[/]".format(number, title))
 
 
+def shutdown() -> None:
+    harness.memory.close()
+    database.close()
+
+
 def fail(console: Console, title: str, message: str) -> None:
     console.print(Panel(escape(database.mask_uri(message)), title=title, border_style="red"))
 
@@ -59,8 +64,9 @@ def banner(console: Console) -> None:
         "[white]Recursive harnessing for tool contracts[/]\n\n"
         "[dim]Problem Statement[/]   Recursive Harnessing\n"
         "[dim]Cerebral Valley[/]   SF Tech Week\n\n"
-        "Task A fails, the outer loop repairs the schema, and Task B\n"
-        "inherits that contract from MongoDB Atlas on the first attempt."
+        "Task A fails, the outer loop repairs the schema, and a v2 guardrail\n"
+        "rejects a call that has no idempotency key. Task B inherits that\n"
+        "contract from MongoDB Atlas on the first attempt."
     )
     console.print(Panel(body, border_style="bright_cyan", padding=(1, 4)))
 
@@ -123,6 +129,7 @@ def summary_table(documents: List[Dict[str, Any]]) -> Table:
     table.add_column("version", justify="right")
     table.add_column("status")
     table.add_column("parameters")
+    table.add_column("guardrail")
     table.add_column("diagnosis")
     table.add_column("created")
     table.add_column("atlas _id")
@@ -138,10 +145,12 @@ def summary_table(documents: List[Dict[str, Any]]) -> Table:
         diagnosis = str(document.get("diagnosis") or "")
         if len(diagnosis) > 72:
             diagnosis = diagnosis[:69] + "..."
+        guardrail = "idempotency" if document.get("guardrails") else "—"
         table.add_row(
             "v{}".format(version),
             "[{}]{}[/]".format(style, status),
             ", ".join(parameters.keys()) or "—",
+            guardrail,
             escape(diagnosis),
             created or "—",
             str(document.get("_id", "")),
@@ -160,6 +169,43 @@ def show_sandbox(console: Console, runs: list) -> None:
                 color=color,
                 status=status,
                 **run,
+            )
+        )
+
+
+def show_cost(console: Console, label: str, report: harness.HarnessReport) -> None:
+    tokens = report.prompt_tokens + report.completion_tokens
+    console.print(
+        "[bold]COST[/]  {}   model calls {}   tokens ~{}".format(
+            label, report.model_calls, tokens
+        )
+    )
+
+
+def show_rejections(console: Console, report: harness.HarnessReport) -> None:
+    patches = report.rejected_patches
+    if not patches:
+        return
+    patch = patches[0]
+    schema = patch.get("schema") or {}
+    parameters = schema.get("parameters") if isinstance(schema.get("parameters"), dict) else {}
+    body = {
+        "reason": patch.get("reason"),
+        "tool": schema.get("name"),
+        "parameters": parameters,
+        "guardrails": patch.get("guardrails") or [],
+    }
+    console.print(
+        Panel(
+            json_block(body),
+            title="[yellow]REJECTED[/]   patch held before commit",
+            border_style="yellow",
+        )
+    )
+    if len(patches) > 1:
+        console.print(
+            "[dim]{} more rejected patch{} held before commit[/]".format(
+                len(patches) - 1, "" if len(patches) == 2 else "es"
             )
         )
 
@@ -187,15 +233,31 @@ def show_task_a(console: Console, report: harness.HarnessReport, cinematic: bool
     console.print("[dim]{}[/]".format(escape(harness.telemetry().note)))
 
     pause(cinematic, 0.45)
+    if harness.TASK_A.get("recall") is False:
+        console.print(
+            "[dim]MEMORY  skipped for Task A so this run shows a first encounter. "
+            "The model has to discover the repair.[/]"
+        )
     proposer = report.proposer or "deterministic"
-    if proposer == "deterministic":
-        console.print("[magenta]OUTER LOOP[/]  [bold]deterministic fallback[/]")
+    if proposer == "atlas-vector-search":
+        match = report.vector_match or {}
+        console.print(
+            "[bright_cyan]VECTOR[/]  Atlas Vector Search  score {:.2f}  prior agent {}".format(
+                float(match.get("score") or 0.0),
+                escape(str(match.get("agent_id") or "")),
+            )
+        )
+        console.print("        [dim]{}[/]".format(escape(str(match.get("trace_text") or ""))))
+        console.print("[magenta]OUTER LOOP[/]  reused the stored repair   model calls 0")
+    elif proposer == "deterministic":
+        console.print("[magenta]OUTER LOOP[/]  [bold]deterministic fallback, last resort[/]")
     else:
         console.print("[magenta]OUTER LOOP[/]  model [bold]{}[/]".format(escape(proposer)))
     if report.proposer_note:
         console.print("[dim]{}[/]".format(escape(report.proposer_note)))
     if report.diagnosis:
         console.print(Panel(escape(report.diagnosis), title="diagnosis", border_style="magenta"))
+    show_rejections(console, report)
     show_sandbox(console, report.sandbox_runs)
     console.print(
         "[green]EVALUATOR[/]  {}".format(escape(report.message))
@@ -205,15 +267,97 @@ def show_task_a(console: Console, report: harness.HarnessReport, cinematic: bool
             report.version_saved, report.document_id
         )
     )
+    show_cost(console, "Task A repair", report)
+    if report.guardrails:
+        console.print(
+            "[green]GUARDRAIL[/]  v{} stores [bold]{}[/]".format(
+                report.version_saved, escape(report.guardrails[0])
+            )
+        )
     console.print()
     if report.schema_after is not None and report.version_saved is not None:
         console.print(side_by_side(report.schema_before, report.schema_after, report.version_saved))
         console.print(schema_diff(report.schema_before, report.schema_after))
-    console.print(request_panel("repaired call  {}".format(report.endpoint), report.request, True))
+    console.print(request_panel("sandbox verify  {}".format(report.endpoint), report.request, True))
 
 
-def show_task_b(console: Console, report: harness.HarnessReport) -> None:
-    step(console, "02", "TASK B   TRANSFERABLE SUCCESS")
+def show_recall(console: Console, report: harness.HarnessReport) -> None:
+    step(console, "02", "VECTOR RECALL   SAME FAILURE, DIFFERENT WORDS")
+    console.print(
+        "[bold]{}[/]   [dim]{}[/]".format(report.title, report.endpoint)
+    )
+    console.print(
+        "The invoices error is phrased differently from the customers error. "
+        "Atlas Vector Search returns the repair Task A stored."
+    )
+    show_task_a_vector = report.vector_match or {}
+    console.print(
+        "[bright_cyan]VECTOR[/]  score {:.2f}  stored by {}".format(
+            float(show_task_a_vector.get("score") or 0.0),
+            escape(str(show_task_a_vector.get("agent_id") or "")),
+        )
+    )
+    console.print(
+        "        [dim]{}[/]".format(escape(str(show_task_a_vector.get("trace_text") or "")))
+    )
+    show_sandbox(console, report.sandbox_runs)
+    console.print(
+        "[green]COMMIT[/]  Atlas accepted v{} only after the sandbox passed".format(
+            report.version_saved
+        )
+    )
+    show_cost(console, "invoice repair", report)
+
+
+def show_guardrail(
+    console: Console,
+    blocked: harness.HarnessReport,
+    allowed: harness.HarnessReport,
+) -> None:
+    step(console, "03", "GUARDRAIL   v2 ONLY")
+    console.print(
+        "v1 stored no guardrail. v2 rejects a customers call that omits the key."
+    )
+    show_sandbox(console, blocked.sandbox_runs)
+    console.print(
+        Panel(
+            escape(blocked.message),
+            title="[red]FAIL[/]   customers without idempotency_key",
+            border_style="red",
+        )
+    )
+    show_cost(console, "blocked call", blocked)
+    show_sandbox(console, allowed.sandbox_runs)
+    console.print(
+        Panel(
+            escape(allowed.message),
+            title="[green]PASS[/]   same call with idempotency_key",
+            border_style="green",
+        )
+    )
+    show_cost(console, "allowed call", allowed)
+    console.print(request_panel("guardrail pass  {}".format(allowed.endpoint), allowed.request, True))
+
+
+def show_index(console: Console, agent_id: str) -> None:
+    try:
+        plan = database.explain_latest(agent_id)
+    except PyMongoError:
+        return
+    console.print(
+        "[bright_cyan]INDEX[/]  {stage}  [bold]{index}[/]  (agent_id 1, version -1)  "
+        "keys examined {keys}  docs examined {docs}  {ms} ms".format(
+            stage=plan["stage"],
+            index=plan["index"] or "none",
+            keys=plan["keys_examined"],
+            docs=plan["docs_examined"],
+            ms=plan["millis"],
+        )
+    )
+
+
+def show_task_b(console: Console, report: harness.HarnessReport, agent_id: str) -> None:
+    step(console, "04", "TASK B   TRANSFERABLE SUCCESS")
     console.print(
         "[bold]{}[/]   [dim]{}[/]".format(report.title, report.endpoint)
     )
@@ -222,6 +366,7 @@ def show_task_b(console: Console, report: harness.HarnessReport) -> None:
             report.version_loaded
         )
     )
+    show_index(console, agent_id)
     show_sandbox(console, report.sandbox_runs)
     if report.ok:
         console.print(
@@ -232,6 +377,7 @@ def show_task_b(console: Console, report: harness.HarnessReport) -> None:
             )
         )
         console.print(request_panel("inherited contract  {}".format(report.endpoint), report.request, True))
+        show_cost(console, "Task B", report)
         return
     console.print(
         Panel(
@@ -243,7 +389,7 @@ def show_task_b(console: Console, report: harness.HarnessReport) -> None:
 
 
 def show_summary(console: Console, agent_id: str, documents: List[Dict[str, Any]]) -> None:
-    step(console, "03", "ATLAS VERIFICATION")
+    step(console, "05", "ATLAS VERIFICATION")
     console.print(summary_table(documents))
     versions = ", ".join("v{}".format(item["version"]) for item in documents)
     console.print(
@@ -252,10 +398,11 @@ def show_summary(console: Console, agent_id: str, documents: List[Dict[str, Any]
     console.print(
         Panel(
             "Atlas  →  Browse Collections  →  [bold]hydra_harness[/]\n"
-            "collection  [bold]agent_states[/]\n"
+            "collection  [bold]agent_states[/]   and   [bold]error_traces[/]\n"
             "agent_id  [bold]{}[/]\n\n"
-            "Task A wrote the repair. Task B read it back and succeeded\n"
-            "on attempt #1.".format(escape(agent_id)),
+            "Task A wrote the repair and embedded the error.\n"
+            "A differently worded invoices failure reused it from Atlas Vector Search.\n"
+            "Task B read v2 back and succeeded on attempt #1 with no model call.".format(escape(agent_id)),
             title="Show the judges",
             border_style="bright_cyan",
         )
@@ -290,6 +437,18 @@ def run_demo(console: Console, cinematic: bool) -> int:
     console.print("[dim]agent_id[/]  {}".format(agent_id))
     traces = harness.telemetry()
     console.print("[dim]telemetry[/]  {}".format(traces.backend))
+    with console.status("[cyan]Preparing Atlas Vector Search…", spinner="dots"):
+        memory_ready = True
+        try:
+            harness.memory.ensure_index()
+        except Exception as exc:
+            memory_ready = False
+            fail(console, "Atlas Vector Search unavailable", str(exc))
+            shutdown()
+            harness.memory.close()
+            return 1
+    if memory_ready:
+        console.print("[green]VECTOR[/]  index [bold]error_trace_vector[/]  on error_traces")
 
     with console.status("[yellow]Task A  ·  executing schema v1…", spinner="dots"):
         started = time.perf_counter()
@@ -299,7 +458,46 @@ def run_demo(console: Console, cinematic: bool) -> int:
     console.print("[dim]harness time  {:.0f} ms[/]".format(elapsed_a))
     if not task_a.repaired or not task_a.ok:
         fail(console, "Task A did not repair", task_a.failure_message or task_a.message)
-        database.close()
+        shutdown()
+        harness.memory.close()
+        return 1
+
+    recall_agent = "hydra-{}".format(secrets.token_hex(3))
+    with console.status("[cyan]Vector recall  ·  waiting for the index, then listing invoices…", spinner="dots"):
+        harness.memory.wait_until_queryable()
+        recall = harness.run_task(recall_agent, harness.TASK_RECALL, repair=True)
+    show_recall(console, recall)
+    if (
+        not recall.ok
+        or recall.proposer != "atlas-vector-search"
+        or recall.model_calls != 0
+    ):
+        fail(
+            console,
+            "Vector recall did not reuse a past repair",
+            recall.failure_message or recall.message,
+        )
+        shutdown()
+        harness.memory.close()
+        return 1
+
+    customers_with_key = {
+        "id": "A2",
+        "title": "List customers with an idempotency key",
+        "endpoint": harness.TASK_A["endpoint"],
+        "payload": dict(harness.TASK_A["payload"], idempotency_key="cust-replay-1"),
+    }
+    with console.status("[yellow]Guardrail  ·  replaying customers…", spinner="dots"):
+        blocked = harness.run_task(agent_id, harness.TASK_A, repair=False)
+        allowed = harness.run_task(agent_id, customers_with_key, repair=False)
+    show_guardrail(console, blocked, allowed)
+    if blocked.ok or blocked.model_calls != 0:
+        fail(console, "Guardrail did not reject the bare call", blocked.message)
+        shutdown()
+        return 1
+    if not allowed.ok or allowed.model_calls != 0:
+        fail(console, "Guardrail did not allow the keyed call", allowed.message)
+        shutdown()
         return 1
 
     with console.status("[green]Task B  ·  loading the repaired contract…", spinner="dots"):
@@ -307,22 +505,30 @@ def run_demo(console: Console, cinematic: bool) -> int:
         task_b = harness.run_task(agent_id, harness.TASK_B, repair=False)
         elapsed_b = (time.perf_counter() - started) * 1000
         pause(cinematic, 0.35)
-    show_task_b(console, task_b)
+    show_task_b(console, task_b, agent_id)
     console.print("[dim]harness time  {:.0f} ms[/]".format(elapsed_b))
-    if not task_b.ok or task_b.version_loaded < 2:
+    if not task_b.ok or task_b.version_loaded < 2 or task_b.model_calls != 0:
         fail(console, "Task B did not inherit v2", task_b.message)
-        database.close()
+        shutdown()
         return 1
+    console.print(
+        "Task A spent {} model call{} and ~{} tokens on the repair. "
+        "Task B spent 0 model calls because the harness already changed.".format(
+            task_a.model_calls,
+            "" if task_a.model_calls == 1 else "s",
+            task_a.prompt_tokens + task_a.completion_tokens,
+        )
+    )
 
     documents = database.list_states(agent_id)
     show_summary(console, agent_id, documents)
     if len(documents) < 2:
         fail(console, "Atlas verification failed", "Expected version 1 and version 2.")
-        database.close()
+        shutdown()
         return 1
 
     traces.shutdown()
-    database.close()
+    shutdown()
     return 0
 
 
@@ -333,7 +539,7 @@ def main() -> None:
         code = run_demo(console, cinematic=not args.fast)
     except KeyboardInterrupt:
         console.print("\n[yellow]Stopped.[/]")
-        database.close()
+        shutdown()
         code = 130
     raise SystemExit(code)
 

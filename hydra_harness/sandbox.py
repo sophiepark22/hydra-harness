@@ -101,7 +101,11 @@ def _worker() -> int:
         )
         return 0
 
-    ok, message = evaluator.validate_tool_execution(schema, payload)
+    ok, message = evaluator.validate_tool_execution(
+        schema,
+        payload,
+        job.get("guardrails") or [],
+    )
     request = evaluator.execution_request(schema, payload) if ok else None
     json.dump(
         {
@@ -115,12 +119,24 @@ def _worker() -> int:
     return 0
 
 
-def execute(schema: Dict[str, Any], payload: Dict[str, Any], *, phase: str) -> SandboxResult:
+def execute(
+    schema: Dict[str, Any],
+    payload: Dict[str, Any],
+    *,
+    phase: str,
+    guardrails: Optional[list] = None,
+) -> SandboxResult:
     """Run one schema trial in a fresh process. The caller decides whether to commit."""
     if os.environ.get("HYDRA_SANDBOX_WORKER") == "1":
         raise RuntimeError("Refusing to start a sandbox from inside a sandbox.")
 
-    job = json.dumps({"schema": schema, "payload": payload})
+    job = json.dumps(
+        {
+            "schema": schema,
+            "payload": payload,
+            "guardrails": list(guardrails or []),
+        }
+    )
     workspace = tempfile.mkdtemp(prefix="hydra-sandbox-")
     proc = subprocess.Popen(
         [sys.executable, "-I", str(ROOT / "sandbox.py"), WORKER_FLAG],

@@ -7,3 +7,6 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+web/node_modules/
+web/.next/
+web/tsconfig.tsbuildinfo

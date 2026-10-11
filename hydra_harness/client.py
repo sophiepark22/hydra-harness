@@ -87,6 +87,9 @@ class HydraHarness:
             "diagnosis": report.diagnosis,
             "failure_message": report.failure_message,
             "sandbox_runs": report.sandbox_runs,
+            "model_calls": report.model_calls,
+            "prompt_tokens": report.prompt_tokens,
+            "completion_tokens": report.completion_tokens,
         }
 
     def self_healing(self, agent_id: str, tool_name: str) -> Callable:

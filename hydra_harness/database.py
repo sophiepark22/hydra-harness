@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import certifi
 from dotenv import load_dotenv
-from pymongo import ASCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.collection import Collection
 from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError, PyMongoError
@@ -112,16 +112,60 @@ def connect() -> tuple:
     return client, database
 
 
+LATEST_INDEX = "agent_latest_version"
+
+
 def _ensure_indexes(collection: Collection) -> None:
+    """Compound index on (agent_id, version desc). The latest-version read is one index scan."""
+    try:
+        existing = collection.index_information()
+    except PyMongoError:
+        return
+    for stale in ("agent_version", LATEST_INDEX):
+        info = existing.get(stale)
+        if info is None:
+            continue
+        if stale == LATEST_INDEX and "partialFilterExpression" not in info:
+            continue
+        try:
+            collection.drop_index(stale)
+        except PyMongoError:
+            pass
     try:
         collection.create_index(
-            [("agent_id", ASCENDING), ("version", ASCENDING)],
+            [("agent_id", ASCENDING), ("version", DESCENDING)],
             unique=True,
-            name="agent_version",
-            partialFilterExpression={"agent_id": {"$type": "string"}},
+            name=LATEST_INDEX,
         )
     except PyMongoError:
         return
+
+
+def explain_latest(agent_id: str) -> Dict[str, Any]:
+    """Explain the Task B read so the demo can show the index scan."""
+    collection = _collection()
+    plan = (
+        collection.find({"agent_id": agent_id})
+        .sort("version", DESCENDING)
+        .limit(1)
+        .explain()
+    )
+    stats = plan.get("executionStats", {})
+    winning = plan.get("queryPlanner", {}).get("winningPlan", {})
+    stage = winning
+    index_name = None
+    while isinstance(stage, dict):
+        if stage.get("stage") == "IXSCAN":
+            index_name = stage.get("indexName")
+            break
+        stage = stage.get("inputStage") or (stage.get("inputStages") or [None])[0]
+    return {
+        "index": index_name,
+        "stage": "IXSCAN" if index_name else str(winning.get("stage")),
+        "keys_examined": int(stats.get("totalKeysExamined", 0)),
+        "docs_examined": int(stats.get("totalDocsExamined", 0)),
+        "millis": int(stats.get("executionTimeMillis", 0)),
+    }
 
 
 def _collection() -> Collection:
@@ -145,6 +189,7 @@ def get_latest_state(
         "version": 1,
         "tool_schema": copy.deepcopy(initial_schema) if initial_schema else baseline_schema(),
         "prompt_rules": baseline_rules(),
+        "guardrails": [],
         "diagnosis": "baseline",
         "created_at": utcnow(),
     }
@@ -163,23 +208,23 @@ def save_mutated_state(
     new_version: int,
     mutated_schema: Dict[str, Any],
     diagnosis: str,
+    guardrails: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Insert a repaired agent version with an Atlas timestamp."""
     previous = get_latest_state(agent_id)
     rules = str(previous.get("prompt_rules") or baseline_rules()).rstrip()
+    learned = [str(item).strip() for item in (guardrails or []) if str(item).strip()]
+    learned_text = "\n".join("- {}".format(item) for item in learned) or "- no guardrail supplied"
     revision = (
-        "{}\n\nContract revision v{}:\n"
-        "- parameters.api_version is required\n"
-        "- parameters.pagination_limit is required\n"
-        "- parameters.auth_bearer is required\n"
-        "Diagnosis: {}\n"
-    ).format(rules, new_version, diagnosis.strip())
+        "{}\n\nContract revision v{}:\n{}\nDiagnosis: {}\n"
+    ).format(rules, new_version, learned_text, diagnosis.strip())
     document = {
         "agent_id": agent_id,
         "session_id": agent_id,
         "version": int(new_version),
         "tool_schema": copy.deepcopy(mutated_schema),
         "prompt_rules": revision,
+        "guardrails": learned,
         "diagnosis": diagnosis.strip(),
         "parent_version": previous.get("version"),
         "created_at": utcnow(),
