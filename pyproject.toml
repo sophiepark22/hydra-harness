@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hydra-harness"
+version = "0.1.0"
+description = "Self-healing tool harness for agents. Failed schemas are repaired in a sandbox and stored in MongoDB."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pymongo>=4.6,<5",
+    "dnspython>=2.4",
+    "certifi>=2024.2.2",
+    "python-dotenv>=1.0",
+    "rich>=13.7",
+    "openai>=1.40,<2",
+    "raindrop-ai>=0.0.19",
+]
+
+[tool.setuptools.packages.find]
+include = ["hydra_harness*"]

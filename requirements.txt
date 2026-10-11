@@ -1,0 +1,7 @@
+pymongo>=4.6,<5
+dnspython>=2.4
+certifi>=2024.2.2
+python-dotenv>=1.0
+rich>=13.7
+openai>=1.40,<2
+raindrop-ai>=0.0.19
