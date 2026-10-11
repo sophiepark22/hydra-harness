@@ -36,7 +36,7 @@ export const PHASES: { id: string; n: string; title: string; line: string; beats
   {
     id: "execute",
     n: "01",
-    title: "Baseline Execution (v1)",
+    title: "Agent Execution Failure",
     line: "Production task encounters runtime schema drift or API contract failure.",
     beats: ["seed", "fail", "trace"],
   },
