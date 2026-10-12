@@ -29,6 +29,8 @@ type Live = {
   taskACalls?: number;
   taskATokens?: number;
   taskBCalls?: number;
+  prompt?: string;
+  reply?: string;
   phaseNotes: Record<string, string>;
   finished: boolean;
 };
@@ -36,7 +38,7 @@ type Live = {
 const EMPTY: Live = {
   agentId: "",
   host: "",
-  status: "Press Play. The run walks the four steps, then you can go back through them.",
+  status: "Press Run. The run walks the four steps, then you can go back through them.",
   schemaRows: [],
   atlasRows: [],
   phaseNotes: {},
@@ -176,7 +178,7 @@ export function DemoBoard() {
         <div>
           <p className="eyebrow">Live demo</p>
           <h1>Watch your AI learn</h1>
-          <p className="lede">Press Play for the live run. When it finishes, use Back and Next to review.</p>
+          <p className="lede">Press Run for the live run. When it finishes, use Back and Next to review.</p>
         </div>
         <div className="controls">
           {review ? (
@@ -203,7 +205,7 @@ export function DemoBoard() {
             </>
           ) : (
             <button type="button" onClick={startRun}>
-              Play
+              Run
             </button>
           )}
         </div>
@@ -240,6 +242,8 @@ function applyBeat(current: Live, payload: Record<string, unknown>): Live {
   if (payload.id === "prove" && typeof payload.ok === "boolean") next.proveOk = payload.ok;
   if (payload.id === "model" && payload.model_calls != null) next.taskACalls = Number(payload.model_calls);
   if (payload.id === "model" && payload.tokens != null) next.taskATokens = Number(payload.tokens);
+  if (payload.id === "model" && typeof payload.prompt === "string" && payload.prompt) next.prompt = payload.prompt;
+  if (payload.id === "model" && typeof payload.reply === "string" && payload.reply) next.reply = payload.reply;
   if (payload.id === "commit" && payload.document_id) next.documentId = String(payload.document_id);
   if (payload.id === "commit" && payload.version != null) next.versionSaved = Number(payload.version);
   if (payload.id === "transfer" && payload.model_calls != null) next.taskBCalls = Number(payload.model_calls);
@@ -329,6 +333,18 @@ function SandboxTrace({ live }: { live: Live }) {
           <div>
             <dt>Result</dt>
             <dd>{live.proveOk ? "Passed. Safe to save." : "Still testing."}</dd>
+          </div>
+          <div className="trace-block">
+            <dt>Prompt to OpenAI</dt>
+            <dd>
+              <pre>{live.prompt || "Waiting for the model prompt."}</pre>
+            </dd>
+          </div>
+          <div className="trace-block">
+            <dt>Model reply</dt>
+            <dd>
+              <pre>{live.reply || "Waiting for the model reply."}</pre>
+            </dd>
           </div>
         </dl>
       ) : (

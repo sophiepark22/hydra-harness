@@ -209,6 +209,9 @@ def save_mutated_state(
     mutated_schema: Dict[str, Any],
     diagnosis: str,
     guardrails: Optional[List[str]] = None,
+    model_prompt: str = "",
+    model_reply: str = "",
+    model_name: str = "",
 ) -> Dict[str, Any]:
     """Insert a repaired agent version with an Atlas timestamp."""
     previous = get_latest_state(agent_id)
@@ -226,6 +229,9 @@ def save_mutated_state(
         "prompt_rules": revision,
         "guardrails": learned,
         "diagnosis": diagnosis.strip(),
+        "model_prompt": model_prompt,
+        "model_reply": model_reply,
+        "model_name": model_name,
         "parent_version": previous.get("version"),
         "created_at": utcnow(),
     }

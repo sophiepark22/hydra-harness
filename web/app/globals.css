@@ -380,6 +380,24 @@ h1 {
   line-height: 1.4;
 }
 
+.trace-block {
+  grid-template-columns: 1fr;
+}
+
+.trace pre {
+  margin: 4px 0 0;
+  padding: 10px;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  background: #fafafa;
+  border: 1px solid #ececec;
+  border-radius: 8px;
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .rail button.done,
 .rail > div.done {
   background: #ffffff;

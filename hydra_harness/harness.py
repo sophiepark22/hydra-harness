@@ -86,6 +86,8 @@ class Proposal:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     invoked_model: bool = False
+    prompt: str = ""
+    reply: str = ""
 
 
 @dataclass
@@ -518,6 +520,7 @@ class LLMProposer:
             "prompt_rules": prompt_rules,
             "tool_schema": schema,
         }
+        user_prompt = json.dumps(payload, indent=2)
         client = OpenAI(api_key=key, timeout=25.0)
         completion = client.chat.completions.create(
             model=model,
@@ -527,7 +530,7 @@ class LLMProposer:
                 {"role": "system", "content": _PROPOSER_INSTRUCTIONS},
                 {
                     "role": "user",
-                    "content": json.dumps(payload),
+                    "content": user_prompt,
                 },
             ],
         )
@@ -543,6 +546,8 @@ class LLMProposer:
         proposal.prompt_tokens = prompt_tokens
         proposal.completion_tokens = completion_tokens
         proposal.invoked_model = True
+        proposal.prompt = "system:\n{}\n\nuser:\n{}".format(_PROPOSER_INSTRUCTIONS, user_prompt)
+        proposal.reply = content
         return proposal
 
 
@@ -690,6 +695,8 @@ def outer_mutation_loop(
         model_calls=usage["model_calls"],
         tokens=usage["prompt_tokens"] + usage["completion_tokens"],
         diagnosis=chosen.diagnosis,
+        prompt=chosen.prompt,
+        reply=chosen.reply,
     )
     stage("prove")
     blocked, verified = _prove(chosen, task)
@@ -715,6 +722,9 @@ def outer_mutation_loop(
         chosen.schema,
         chosen.diagnosis,
         guardrails=chosen.guardrails,
+        model_prompt=chosen.prompt,
+        model_reply=chosen.reply,
+        model_name=chosen.source,
     )
     stage(
         "commit",

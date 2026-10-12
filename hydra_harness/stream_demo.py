@@ -108,6 +108,8 @@ def run() -> int:
             payload["model_calls"] = calls
             payload["tokens"] = info.get("tokens")
             payload["diagnosis"] = info.get("diagnosis")
+            payload["prompt"] = info.get("prompt") or ""
+            payload["reply"] = info.get("reply") or ""
             payload["log"] = (
                 "The model filled in the missing details."
                 if calls

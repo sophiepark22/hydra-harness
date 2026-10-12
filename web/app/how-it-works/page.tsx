@@ -27,7 +27,7 @@ export default function HowItWorks() {
         <p className="eyebrow">How it works</p>
         <h1>Four steps, one live run</h1>
         <p className="lede">
-          Press Play. The live run walks the four steps. When it finishes, Back and Next revisit any step, and the panel on the right shows that step’s proof.
+          Press Run. The live run walks the four steps. When it finishes, Back and Next revisit any step, and the panel on the right shows that step’s proof.
         </p>
       </header>
 
